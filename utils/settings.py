@@ -6,7 +6,7 @@ from typing import Dict, Tuple
 
 import toml
 
-config = dict  # autocomplete
+config = {}  # Will be initialized by check_toml function
 
 
 def crawl(obj: dict, func=lambda x, y: print(x, y, end="\n"), path=None):

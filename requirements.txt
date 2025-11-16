@@ -2,7 +2,10 @@ apify==3.0.1
 beautifulsoup4==4.13.4
 camoufox==0.4.11
 coloredlogs==15.0.1
+fastapi==0.115.0
 Js2Py==0.74
 pandas==2.3.0
 playwright==1.52.0
+requests==2.31.0
 toml==0.10.2
+uvicorn==0.32.0

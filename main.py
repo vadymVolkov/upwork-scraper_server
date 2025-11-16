@@ -1,21 +1,15 @@
 import argparse
 import ast
 import asyncio
-import concurrent.futures
-import contextlib
-import csv
 import datetime
-import io
 import json
 import logging
 import os
 import re
 import sys
 import time
-from collections import deque
 from urllib.parse import urlparse, urlunparse
 
-import js2py
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -27,6 +21,10 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from camoufox_captcha import solve_captcha
 from utils.attr_extractor import extract_job_attributes
 from utils.logger import Logger
+
+# Initialize logger (will be overridden in __main__ block if run directly)
+logger_obj = Logger(level="INFO")
+logger = logger_obj.get_logger()
 
 UPWORK_MAIN_CATEGORIES = {
     # Main Categories
@@ -405,8 +403,124 @@ async def login_process(
             logger.debug(f"Password entered.")
             await page.press('#login_password', 'Enter')
             await asyncio.sleep(3)
+            
+            # Check for 2FA verification code input
             body_text = await page.locator('body').inner_text()
-            # error_texts = ['Verification failed. Please try again.', 'Please fix the errors below', 'Due to technical difficulties we are unable to process your request.']
+            page_url = page.url
+            
+            # Common 2FA indicators
+            two_factor_indicators = [
+                'verification code',
+                'enter code',
+                'two-factor',
+                '2fa',
+                'authentication code',
+                'security code',
+                'enter the code',
+                'verif'  # Short for verification
+            ]
+            
+            # Check if 2FA is required
+            is_2fa_required = False
+            for indicator in two_factor_indicators:
+                if indicator.lower() in body_text.lower():
+                    is_2fa_required = True
+                    break
+            
+            # Also check for common 2FA input field selectors
+            two_factor_selectors = [
+                'input[type="text"][name*="code"]',
+                'input[type="text"][name*="verification"]',
+                'input[type="text"][name*="otp"]',
+                'input[type="number"][name*="code"]',
+                'input[id*="code"]',
+                'input[id*="verification"]',
+                'input[id*="otp"]',
+                'input[placeholder*="code" i]',
+                'input[placeholder*="verification" i]',
+            ]
+            
+            for selector in two_factor_selectors:
+                try:
+                    element = await page.query_selector(selector)
+                    if element:
+                        is_2fa_required = True
+                        break
+                except:
+                    pass
+            
+            if is_2fa_required:
+                logger.info("🔐 Two-factor authentication (2FA) detected!")
+                logger.info("⏳ Waiting for you to enter the verification code in the browser...")
+                logger.info("💡 Please enter the code from your SMS/authenticator app and complete the login.")
+                
+                # Wait for successful login - check for indicators that login completed
+                max_wait_time = 300  # 5 minutes max wait
+                check_interval = 2  # Check every 2 seconds
+                waited_time = 0
+                
+                login_success_indicators = [
+                    '/home',
+                    '/find-work',
+                    '/nx/find-work',
+                    '/dashboard',
+                    'upwork.com/nx',
+                ]
+                
+                while waited_time < max_wait_time:
+                    await asyncio.sleep(check_interval)
+                    waited_time += check_interval
+                    
+                    try:
+                        current_url = page.url
+                        current_body = await page.locator('body').inner_text()
+                        
+                        # Check if we're logged in by URL
+                        for indicator in login_success_indicators:
+                            if indicator in current_url.lower():
+                                logger.info("✅ Login successful! 2FA verification completed.")
+                                return True
+                        
+                        # Check if 2FA field is still present (login not complete)
+                        still_has_2fa = False
+                        for selector in two_factor_selectors:
+                            try:
+                                element = await page.query_selector(selector)
+                                if element:
+                                    still_has_2fa = True
+                                    break
+                            except:
+                                pass
+                        
+                        # If 2FA field is gone and we're not on login page, assume success
+                        if not still_has_2fa and 'login' not in current_url.lower() and 'account-security' not in current_url.lower():
+                            # Check for login success indicators in body
+                            if 'log out' in current_body.lower() or 'sign out' in current_body.lower() or 'dashboard' in current_body.lower():
+                                logger.info("✅ Login successful! 2FA verification completed.")
+                                return True
+                        
+                        # Show progress every 30 seconds
+                        if waited_time % 30 == 0:
+                            logger.info(f"⏳ Still waiting for 2FA code... ({waited_time}s / {max_wait_time}s)")
+                    
+                    except Exception as e:
+                        logger.debug(f"Error checking login status: {e}")
+                        continue
+                
+                logger.warning("⚠️ Timeout waiting for 2FA verification. Please check if login was successful.")
+                # Final check
+                try:
+                    current_url = page.url
+                    for indicator in login_success_indicators:
+                        if indicator in current_url.lower():
+                            logger.info("✅ Login successful!")
+                            return True
+                except:
+                    pass
+                
+                return False
+            
+            # Check for errors (original logic)
             if 'Verification failed. Please try again.' in body_text[:100] or 'Please fix the errors below' in body_text[:100] or "Due to technical difficulties we are unable to process your request." in body_text[:100]:
                 logger.debug(f"Verification on login failed. Attempt {attempt}/{max_attempts}")
                 # Try reloading or creating a new page, but do NOT clear cookies yet
@@ -414,6 +528,7 @@ async def login_process(
                     logger.debug("Creating a new page due to repeated login failures.")
                     page = await context.new_page()
                 continue
+            
             logger.debug(f"Login process complete.")
             logger.debug(f"Body text: {body_text[:100]}")
             return True
@@ -430,11 +545,13 @@ async def login_and_solve(
     password: str,
     search_url: str,
     login_url: str,
-    credentials_provided: bool
+    credentials_provided: bool,
+    cookies_file_path: str = None
 ) -> tuple[Page, BrowserContext]:
     """
     Navigate to Upwork, solve captcha if present, and log in if credentials are provided.
     If a new context or cookies are cleared, re-solve captcha before login.
+    Tries to load saved cookies first, and saves cookies after successful login.
 
     :param page: Playwright Page object to use for navigation and interaction
     :type page: Page
@@ -450,9 +567,31 @@ async def login_and_solve(
     :type login_url: str
     :param credentials_provided: Whether Upwork credentials are provided (affects login behavior)
     :type credentials_provided: bool
+    :param cookies_file_path: Path to cookies file for saving/loading
+    :type cookies_file_path: str, optional
     :return: Tuple of (page, context) after login/captcha (or attempted login)
     :rtype: tuple[Page, BrowserContext]
     """
+    # Try to load saved cookies first if credentials are provided
+    if credentials_provided and cookies_file_path:
+        cookies_loaded = await load_cookies_from_file(context, cookies_file_path)
+        if cookies_loaded:
+            # Verify cookies are still valid
+            logger.info("🔍 Verifying saved cookies...")
+            await safe_goto(page, search_url, context)
+            # Solve captcha if needed
+            captcha_solved = await solve_captcha(queryable=page, browser_context=context, captcha_type='cloudflare', challenge_type='interstitial', solve_attempts = 5, solve_click_delay = 6, wait_checkbox_attempts = 5, wait_checkbox_delay = 5, checkbox_click_attempts = 3, attempt_delay = 5)
+            if captcha_solved:
+                logger.debug(f"Successfully solved captcha challenge!")
+            
+            cookies_valid = await verify_cookies_validity(page, context)
+            if cookies_valid:
+                logger.info("✅ Using saved cookies - login not required!")
+                return page, context
+            else:
+                logger.info("⚠️ Saved cookies are invalid or expired. Proceeding with login...")
+                await context.clear_cookies()
+    
     # go to search url
     await safe_goto(page, search_url, context)
     # bypass captcha
@@ -464,6 +603,7 @@ async def login_and_solve(
         logger.warning(f"⚠️ No captcha challenge detected or failed to solve captcha.")
     # if credentials are provided, login
     if credentials_provided:
+        logger.info("🔐 Credentials provided - attempting login...")
         logger.debug(f"Logging in...")
         login_success = await login_process(login_url, page, context, username, password)
         # if login fails, try clearing cookies and re-solving captcha
@@ -489,12 +629,115 @@ async def login_and_solve(
                     logger.debug(f"Body text: {body_text}")
                 else:
                     logger.info("✅ Login succeeded after last resort attempt.")
+                    # Save cookies after successful login
+                    if cookies_file_path:
+                        await save_cookies_to_file(context, cookies_file_path)
                     # return page and context so that new context is used for scraping
                     return page, context
             except Exception as e:
                 logger.error(f"⚠️ Exception during last resort login attempt: {e}")
+        else:
+            # Login succeeded on first attempt - save cookies
+            if cookies_file_path:
+                await save_cookies_to_file(context, cookies_file_path)
+    else:
+        logger.info("ℹ️ No credentials provided - skipping login, proceeding with search only")
     return page, context
 
+
+async def save_cookies_to_file(context: BrowserContext, cookies_file_path: str):
+    """
+    Save cookies from Playwright context to a JSON file.
+
+    :param context: Playwright BrowserContext object
+    :type context: BrowserContext
+    :param cookies_file_path: Path to the cookies file
+    :type cookies_file_path: str
+    """
+    try:
+        cookies = await context.cookies()
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(cookies_file_path), exist_ok=True)
+        with open(cookies_file_path, 'w') as f:
+            json.dump(cookies, f, indent=2)
+        logger.info(f"💾 Cookies saved to {cookies_file_path}")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to save cookies: {e}")
+
+async def load_cookies_from_file(context: BrowserContext, cookies_file_path: str) -> bool:
+    """
+    Load cookies from a JSON file into Playwright context.
+
+    :param context: Playwright BrowserContext object
+    :type context: BrowserContext
+    :param cookies_file_path: Path to the cookies file
+    :type cookies_file_path: str
+    :return: True if cookies were loaded successfully, False otherwise
+    :rtype: bool
+    """
+    try:
+        if not os.path.exists(cookies_file_path):
+            logger.debug(f"Cookies file not found: {cookies_file_path}")
+            return False
+        
+        with open(cookies_file_path, 'r') as f:
+            cookies = json.load(f)
+        
+        if not cookies:
+            logger.debug("Cookies file is empty")
+            return False
+        
+        await context.add_cookies(cookies)
+        logger.info(f"📂 Cookies loaded from {cookies_file_path}")
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to load cookies: {e}")
+        return False
+
+async def verify_cookies_validity(page: Page, context: BrowserContext) -> bool:
+    """
+    Verify if loaded cookies are still valid by checking if we're logged in.
+
+    :param page: Playwright Page object
+    :type page: Page
+    :param context: Playwright BrowserContext object
+    :type context: BrowserContext
+    :return: True if cookies are valid (user is logged in), False otherwise
+    :rtype: bool
+    """
+    try:
+        # Try to navigate to a page that requires authentication
+        await page.goto('https://www.upwork.com/nx/find-work/', timeout=30000, wait_until='domcontentloaded')
+        await asyncio.sleep(2)
+        
+        body_text = await page.locator('body').inner_text()
+        current_url = page.url
+        
+        # Check if we're logged in
+        login_indicators = ['log in', 'sign up', 'account-security/login']
+        logged_in_indicators = ['find work', 'dashboard', 'log out', 'sign out', '/nx/find-work']
+        
+        # If we see login indicators, cookies are invalid
+        for indicator in login_indicators:
+            if indicator.lower() in body_text.lower() or indicator in current_url.lower():
+                logger.debug("Cookies appear to be invalid (login page detected)")
+                return False
+        
+        # If we see logged in indicators, cookies are valid
+        for indicator in logged_in_indicators:
+            if indicator.lower() in body_text.lower() or indicator in current_url.lower():
+                logger.info("✅ Cookies are valid - user is logged in")
+                return True
+        
+        # If URL contains /nx/ and not login, assume valid
+        if '/nx/' in current_url and 'login' not in current_url:
+            logger.info("✅ Cookies appear to be valid")
+            return True
+        
+        return False
+    except Exception as e:
+        logger.debug(f"Error verifying cookies: {e}")
+        return False
 
 def playwright_cookies_to_requests(cookies):
     """
@@ -692,7 +935,7 @@ def fetch_job_detail(session, url, credentials_provided):
 
 def browser_worker_requests(session, job_urls, credentials_provided, max_workers=20):
     """
-    Fetch job details in parallel using ThreadPoolExecutor for speed.
+    Fetch job details sequentially with delay to avoid rate limiting.
 
     :param session: requests.Session object with cookies and headers set
     :type session: requests.Session
@@ -700,21 +943,23 @@ def browser_worker_requests(session, job_urls, credentials_provided, max_workers
     :type job_urls: list[str]
     :param credentials_provided: Whether Upwork credentials are provided (affects restricted fields)
     :type credentials_provided: bool
-    :param max_workers: Maximum number of worker threads to use
+    :param max_workers: Maximum number of worker threads to use (not used, kept for compatibility)
     :type max_workers: int, optional
     :return: List of job attribute dictionaries
     :rtype: list[dict]
     """
     job_attributes = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(fetch_job_detail, session, url, credentials_provided)
-            for url in job_urls
-        ]
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            if result:
-                job_attributes.append(result)
+    request_delay = 1  # Delay in seconds between requests
+    
+    for i, url in enumerate(job_urls):
+        result = fetch_job_detail(session, url, credentials_provided)
+        if result:
+            job_attributes.append(result)
+        
+        # Add delay between requests (except for the last one)
+        if i < len(job_urls) - 1:
+            time.sleep(request_delay)
+    
     return job_attributes
 
 
@@ -774,9 +1019,18 @@ async def main(jsonInput: dict) -> list[dict]:
     
     logger.debug(f"proxy_details: {proxy_details}")
     
+    # Prepare cookies file path based on username
+    cookies_file_path = None
+    if credentials_provided and username:
+        # Create safe filename from username
+        safe_username = re.sub(r'[^\w\-_.]', '_', username)
+        cookies_dir = os.path.join('cookies')
+        os.makedirs(cookies_dir, exist_ok=True)
+        cookies_file_path = os.path.join(cookies_dir, f'{safe_username}_cookies.json')
+        logger.debug(f"Cookies file path: {cookies_file_path}")
     
     # Only one browser for login/captcha
-    async with AsyncCamoufox(headless=True, geoip=True, humanize=True, i_know_what_im_doing=True, config={'forceScopeAccess': True}, disable_coop=True, proxy=proxy_details) as browser:
+    async with AsyncCamoufox(headless=False, geoip=True, humanize=True, i_know_what_im_doing=True, config={'forceScopeAccess': True}, disable_coop=True, proxy=proxy_details) as browser:
         logger.info("🌐 Creating browser/context/page for login...")
         try:
             context = await browser.new_context()
@@ -785,8 +1039,11 @@ async def main(jsonInput: dict) -> list[dict]:
             logger.error(f"⚠️ Error creating browser: {e}")
             sys.exit(1)
         try:
-            logger.info("🔒 Solving Captcha and Logging in...")
-            page, context = await login_and_solve(page, context, username, password, search_url, login_url, credentials_provided)
+            if credentials_provided:
+                logger.info("🔒 Solving Captcha and Logging in...")
+            else:
+                logger.info("🔒 Solving Captcha (no login - credentials not provided)...")
+            page, context = await login_and_solve(page, context, username, password, search_url, login_url, credentials_provided, cookies_file_path)
         except Exception as e:
             logger.error(f"⚠️ Error logging in: {e}")
             sys.exit(1)
@@ -816,6 +1073,7 @@ async def main(jsonInput: dict) -> list[dict]:
     job_attributes = job_attributes[:limit-buffer]
     # Push to Apify dataset if running on Apify
     if os.environ.get("ACTOR_INPUT_KEY"):
+        from apify import Actor
         for item in job_attributes:
             await Actor.push_data(item)
     if save_csv:

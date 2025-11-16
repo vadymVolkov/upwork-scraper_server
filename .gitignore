@@ -2,6 +2,15 @@ __pycache__/
 *tempCodeRunnerFile.py
 .DS_Store
 
+# Virtual environment
+venv/
+env/
+ENV/
+.venv
+
+# Cookies (sensitive data)
+cookies/
+
 # Config files
 config.toml
 
