@@ -1,12 +1,18 @@
 import json as _json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Dict, Tuple
 
 import toml
 
 config = {}  # Will be initialized by check_toml function
+
+# Check if running in non-interactive mode (server mode)
+def is_non_interactive():
+    """Check if running in non-interactive mode (no TTY available)"""
+    return not sys.stdin.isatty() or os.getenv('NON_INTERACTIVE', '').lower() in ('1', 'true', 'yes')
 
 
 def crawl(obj: dict, func=lambda x, y: print(x, y, end="\n"), path=None):
@@ -84,6 +90,11 @@ def check(value, checks, name):
         incorrect = True
 
     if incorrect:
+        # In non-interactive mode, skip optional fields or use defaults
+        is_optional = get_check_value("optional", False)
+        if is_non_interactive() and is_optional:
+            return get_check_value("default", "" if is_optional else NotImplemented)
+        
         value = handle_input(
             message=(
                 (
@@ -125,6 +136,10 @@ def handle_input(
     default=NotImplemented,
     optional=False,
 ):
+    # In non-interactive mode (server), skip optional fields automatically
+    if is_non_interactive() and optional:
+        return default if default is not NotImplemented else ""
+    
     if optional:
         print(message + "\nThis is an optional value. Do you want to skip it? (y/n)")
         if input().casefold().startswith("y"):

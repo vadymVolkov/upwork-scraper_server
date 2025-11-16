@@ -14,6 +14,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from camoufox import AsyncCamoufox
+from dotenv import load_dotenv
 from playwright._impl._errors import TargetClosedError
 from playwright.async_api import BrowserContext, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -21,6 +22,9 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from camoufox_captcha import solve_captcha
 from utils.attr_extractor import extract_job_attributes
 from utils.logger import Logger
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Initialize logger (will be overridden in __main__ block if run directly)
 logger_obj = Logger(level="INFO")
@@ -1030,7 +1034,7 @@ async def main(jsonInput: dict) -> list[dict]:
         logger.debug(f"Cookies file path: {cookies_file_path}")
     
     # Only one browser for login/captcha
-    async with AsyncCamoufox(headless=False, geoip=True, humanize=True, i_know_what_im_doing=True, config={'forceScopeAccess': True}, disable_coop=True, proxy=proxy_details) as browser:
+    async with AsyncCamoufox(headless=True, geoip=True, humanize=True, i_know_what_im_doing=True, config={'forceScopeAccess': True}, disable_coop=True, proxy=proxy_details) as browser:
         logger.info("🌐 Creating browser/context/page for login...")
         try:
             context = await browser.new_context()
@@ -1175,16 +1179,21 @@ if __name__ == "__main__":
         # start
         asyncio.run(run_actor())
         sys.exit(0)
-    # load from config.toml
+    # load from config.toml or .env
     else:
         from utils.settings import config
+        
+        # Try to get credentials from .env first, fallback to config.toml
+        username = os.getenv('UPWORK_USERNAME') or (config.get('Credentials', {}).get('username') if isinstance(config, dict) else None)
+        password = os.getenv('UPWORK_PASSWORD') or (config.get('Credentials', {}).get('password') if isinstance(config, dict) else None)
+        
         input_data = {
             'credentials': {
-                'username': config['Credentials']['username'],
-                'password': config['Credentials']['password']
+                'username': username,
+                'password': password
             },
-            'search': config.get('Search', {}),
-            'general': config.get('General', {})
+            'search': config.get('Search', {}) if isinstance(config, dict) else {},
+            'general': config.get('General', {}) if isinstance(config, dict) else {}
         }
 
     logger.debug(f"input_data: {input_data}")

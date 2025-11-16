@@ -2,11 +2,21 @@
 HTTP Server for Upwork Job Scraper API
 Provides GET endpoint to search for jobs with query and limit parameters
 """
+import os
+
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
+# Set non-interactive mode before importing settings
+# This prevents interactive prompts when loading config.toml
+os.environ['NON_INTERACTIVE'] = '1'
+
 from main import main, logger
 from utils.settings import config
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -42,10 +52,13 @@ async def search_jobs(
     try:
         logger.info(f"🔍 Received search request: query='{query}', limit={limit}")
         
-        # Load credentials from config.toml
+        # Load credentials from .env first, fallback to config.toml
+        username = os.getenv('UPWORK_USERNAME') or (config.get('Credentials', {}).get('username') if isinstance(config, dict) else None)
+        password = os.getenv('UPWORK_PASSWORD') or (config.get('Credentials', {}).get('password') if isinstance(config, dict) else None)
+        
         credentials = {
-            'username': config.get('Credentials', {}).get('username') if isinstance(config, dict) else None,
-            'password': config.get('Credentials', {}).get('password') if isinstance(config, dict) else None
+            'username': username,
+            'password': password
         }
         
         # Load default search parameters from config

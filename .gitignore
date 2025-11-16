@@ -14,6 +14,11 @@ cookies/
 # Config files
 config.toml
 
+# Environment variables
+.env
+.env.local
+.env.*.local
+
 # Testing files
 testing/
 test*
