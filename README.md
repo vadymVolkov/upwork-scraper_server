@@ -1,11 +1,14 @@
-# Upwork Job Scraper API Server
+# Upwork Job Scraper
 
-HTTP сервер для поиска вакансий на Upwork с использованием FastAPI.
+Проект работает в двух режимах:
+- отдельный CLI-сервис;
+- отдельный REST API-сервис.
 
 ## Documentation
 
 - CLI документация: `README-CLI.md`
 - REST API документация: `README-API.md`
+- Production REST base URL: `https://api.scriptium.com`
 
 ## Установка
 
@@ -22,55 +25,40 @@ UPWORK_PASSWORD=your_password
 
 3. Настройте параметры поиска в файле `config.toml` (опционально)
 
-## Запуск сервера
+## Быстрый запуск
 
+### CLI
 ```bash
-python server.py
+python -m src.cli.app --help
 ```
 
-Или используя uvicorn напрямую:
+### API (локально)
 ```bash
-uvicorn server:app --host 0.0.0.0 --port 8000
+uvicorn src.api.app:app --host 0.0.0.0 --port 8000
 ```
 
 Сервер будет доступен по адресу: `http://localhost:8000`
 
-## API Endpoints
+### Legacy-совместимость
 
-### GET `/search`
+Старый режим команд сохранён:
 
-Поиск вакансий на Upwork.
-
-**Параметры:**
-- `query` (обязательный) - текст для поиска
-- `limit` (опциональный) - количество результатов (1-100, по умолчанию: 10)
-
-**Пример запроса:**
-```
-GET /search?query=n8n&limit=10
+```bash
+python main.py --command search --jsonInput '{"search":{"query":"n8n","limit":10}}'
 ```
 
-**Пример ответа:**
-```json
-{
-  "success": true,
-  "query": "n8n",
-  "limit": 10,
-  "count": 10,
-  "jobs": [
-    {
-      "title": "Job Title",
-      "description": "Job Description",
-      "url": "https://www.upwork.com/jobs/...",
-      ...
-    }
-  ]
-}
-```
+## API Endpoints (v1)
 
-**Полный URL для запроса:**
-```
-http://localhost:8000/search?query=n8n&limit=10
+```text
+GET  /v1/health
+POST /v1/auth/login
+POST /v1/search
+POST /v1/collect-urls
+POST /v1/collect-bestmatch-urls
+POST /v1/parse-job-urls
+POST /v1/parse-bestmatch-urls
+POST /v1/pull-jobs
+POST /v1/pull-bestmatch-jobs
 ```
 
 ## Описание возвращаемых данных
