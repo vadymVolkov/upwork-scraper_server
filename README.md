@@ -2,6 +2,11 @@
 
 HTTP сервер для поиска вакансий на Upwork с использованием FastAPI.
 
+## Documentation
+
+- CLI документация: `README-CLI.md`
+- REST API документация: `README-API.md`
+
 ## Установка
 
 1. Установите зависимости:

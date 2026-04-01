@@ -30,5 +30,5 @@ ENV CAMOUFOX_ARCH=x64
 ENV PROCESSOR_ARCHITECTURE=AMD64
 ENV ARCH=x64
 
-# Entrypoint
-CMD ["python", "main.py"] 
+# Default entrypoint (CLI service mode)
+CMD ["python", "-m", "src.cli.app", "--help"]

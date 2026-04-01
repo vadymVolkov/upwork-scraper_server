@@ -9,6 +9,15 @@ import toml
 
 config = {}  # Will be initialized by check_toml function
 
+TYPE_RESOLVER = {
+    "str": str,
+    "int": int,
+    "float": float,
+    "bool": bool,
+    "list": list,
+    "dict": dict,
+}
+
 # Check if running in non-interactive mode (server mode)
 def is_non_interactive():
     """Check if running in non-interactive mode (no TTY available)"""
@@ -36,7 +45,10 @@ def check(value, checks, name):
         incorrect = True
     if not incorrect and "type" in checks:
         try:
-            value = eval(checks["type"])(value)
+            cast_type = TYPE_RESOLVER.get(str(checks["type"]).strip())
+            if cast_type is None:
+                raise ValueError(f"Unsupported type cast: {checks['type']}")
+            value = cast_type(value)
         except Exception as e:
             print(f"DEBUG: Value for {name} failed type check ({checks['type']}): {value} ({e})")
             incorrect = True
@@ -108,7 +120,7 @@ def check(value, checks, name):
             )
             + str(name),
             extra_info=get_check_value("explanation", ""),
-            check_type=eval(get_check_value("type", "False")),
+            check_type=TYPE_RESOLVER.get(str(get_check_value("type", "")).strip(), False),
             default=get_check_value("default", NotImplemented),
             match=get_check_value("regex", ""),
             err_message=get_check_value("input_error", "Incorrect input"),
@@ -193,7 +205,6 @@ def handle_input(
         user_input = input("").strip()
         if check_type is not False:
             try:
-                isinstance(eval(user_input), check_type)
                 return check_type(user_input)
             except:
                 print(

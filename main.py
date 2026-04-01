@@ -6,8 +6,10 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import time
+from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
 import pandas as pd
@@ -524,17 +526,37 @@ async def login_process(
                 
                 return False
             
-            # Check for errors (original logic)
-            if 'Verification failed. Please try again.' in body_text[:100] or 'Please fix the errors below' in body_text[:100] or "Due to technical difficulties we are unable to process your request." in body_text[:100]:
+            body_text_lower = body_text.lower()
+
+            # Check for explicit login error messages across full page text
+            login_error_indicators = [
+                'username or password is incorrect',
+                'verification failed. please try again.',
+                'please fix the errors below',
+                'unable to process your request',
+                'invalid username or password',
+            ]
+            if any(indicator in body_text_lower for indicator in login_error_indicators):
                 logger.debug(f"Verification on login failed. Attempt {attempt}/{max_attempts}")
                 # Try reloading or creating a new page, but do NOT clear cookies yet
                 if attempt == max_attempts // 2:
                     logger.debug("Creating a new page due to repeated login failures.")
                     page = await context.new_page()
                 continue
-            
-            logger.debug(f"Login process complete.")
-            logger.debug(f"Body text: {body_text[:100]}")
+
+            # Success heuristics: after submit we must leave login pages or see signed-in cues
+            page_url_lower = page_url.lower()
+            if (
+                ('account-security/login' in page_url_lower or '/login' in page_url_lower)
+                and 'dashboard' not in body_text_lower
+                and 'log out' not in body_text_lower
+                and 'sign out' not in body_text_lower
+            ):
+                logger.debug("Still on login page after submit; treating as unsuccessful login attempt.")
+                continue
+
+            logger.debug("Login process complete.")
+            logger.debug(f"Body text: {body_text[:160]}")
             return True
         except Exception as e:
             logger.debug(f"Login attempt {attempt} failed: {e}")
@@ -967,6 +989,499 @@ def browser_worker_requests(session, job_urls, credentials_provided, max_workers
     return job_attributes
 
 
+def resolve_credentials(json_input: dict) -> tuple[str | None, str | None]:
+    """Resolve credentials from json input with .env fallback."""
+    credentials_json = json_input.get("credentials", json_input)
+    username = credentials_json.get("username") or os.getenv("UPWORK_USERNAME")
+    password = credentials_json.get("password") or os.getenv("UPWORK_PASSWORD")
+    return username, password
+
+
+def build_cookies_file_path(username: str | None) -> str | None:
+    """Build per-user cookies file path based on username."""
+    if not username:
+        return None
+    safe_username = re.sub(r"[^\w\-_.]", "_", username)
+    project_dir = Path(__file__).resolve().parent
+    cookies_dir = project_dir / "cookies"
+    os.makedirs(cookies_dir, exist_ok=True)
+    return str(cookies_dir / f"{safe_username}_cookies.json")
+
+
+def parse_and_validate_limit(search_params: dict, *, required: bool) -> int:
+    """Validate limit from search params and return int."""
+    raw_limit = search_params.get("limit", None)
+    if raw_limit is None:
+        if required:
+            raise RuntimeError("search.limit is required and must be an integer from 1 to 100.")
+        return 20
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError):
+        raise RuntimeError("search.limit must be an integer from 1 to 100.")
+    if limit < 1 or limit > 100:
+        raise RuntimeError("search.limit must be in range 1..100.")
+    return limit
+
+
+def extract_job_id_from_url(url: str) -> str | None:
+    match = re.search(r"~([0-9a-zA-Z]+)", url)
+    return match.group(1) if match else None
+
+
+def get_db_path() -> str:
+    project_dir = Path(__file__).resolve().parent
+    return str(project_dir / "data" / "upwork_jobs.db")
+
+
+DETAIL_COLUMNS = [
+    "title",
+    "description",
+    "url",
+    "job_id",
+    "type",
+    "level",
+    "duration",
+    "category",
+    "category_name",
+    "category_urlSlug",
+    "categoryGroup_name",
+    "categoryGroup_urlSlug",
+    "hourly_min",
+    "hourly_max",
+    "fixed_budget_amount",
+    "currency",
+    "connects_required",
+    "client_country",
+    "client_company_size",
+    "client_industry",
+    "client_hires",
+    "client_rating",
+    "client_reviews",
+    "client_total_spent",
+    "buyer_hire_rate_pct",
+    "buyer_avgHourlyJobsRate_amount",
+    "buyer_jobs_openCount",
+    "buyer_jobs_postedCount",
+    "buyer_stats_hoursCount",
+    "buyer_stats_totalJobsWithHires",
+    "buyer_stats_activeAssignmentsCount",
+    "buyer_company_contractDate",
+    "buyer_location_city",
+    "buyer_location_countryTimezone",
+    "buyer_location_localTime",
+    "buyer_location_offsetFromUtcMillis",
+    "clientActivity_invitationsSent",
+    "clientActivity_totalHired",
+    "clientActivity_totalInvitedToInterview",
+    "clientActivity_unansweredInvites",
+    "lastBuyerActivity",
+    "applicants",
+    "numberOfPositionsToHire",
+    "skills",
+    "qualifications",
+    "questions",
+    "contractorTier",
+    "payment_verified",
+    "phone_verified",
+    "premium",
+    "enterpriseJob",
+    "isContractToHire",
+    "ts_create",
+    "ts_publish",
+]
+
+
+def to_db_text(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def upsert_parsed_job(
+    conn: sqlite3.Connection,
+    target_table: str,
+    fk_column: str,
+    fk_id: int,
+    details: dict,
+) -> None:
+    data = {col: to_db_text(details.get(col)) for col in DETAIL_COLUMNS}
+    data["payload_json"] = json.dumps(details, ensure_ascii=False)
+
+    columns = [fk_column, "fetched_at"] + DETAIL_COLUMNS + ["payload_json"]
+    placeholders = ", ".join(["?"] * len(columns))
+    update_cols = ["fetched_at"] + DETAIL_COLUMNS + ["payload_json"]
+    update_sql = ", ".join([f"{col}=excluded.{col}" for col in update_cols])
+
+    values = [fk_id, datetime.datetime.utcnow().isoformat()] + [data[col] for col in DETAIL_COLUMNS] + [data["payload_json"]]
+
+    conn.execute(
+        f"""
+        INSERT INTO {target_table} ({", ".join(columns)})
+        VALUES ({placeholders})
+        ON CONFLICT({fk_column}) DO UPDATE SET
+        {update_sql}
+        """,
+        values,
+    )
+
+
+def fetch_unchecked_jobs(table_name: str, limit: int) -> list[dict]:
+    """Fetch unchecked jobs from DB and mark them as checked."""
+    if table_name not in ("jobs", "job_bestmach"):
+        raise RuntimeError(f"Unsupported jobs table: {table_name}")
+    if limit < 1 or limit > 1000:
+        raise RuntimeError("limit must be in range 1..1000.")
+
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM {table_name}
+            WHERE is_checked = 0
+            ORDER BY fetched_at ASC, id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+        if not rows:
+            return []
+
+        ids = [row["id"] for row in rows]
+        placeholders = ",".join(["?"] * len(ids))
+        conn.execute(
+            f"UPDATE {table_name} SET is_checked = 1 WHERE id IN ({placeholders})",
+            ids,
+        )
+        conn.commit()
+
+        result = []
+        for row in rows:
+            item = dict(row)
+            payload_raw = item.get("payload_json")
+            if payload_raw:
+                try:
+                    item["payload_json"] = json.loads(payload_raw)
+                except json.JSONDecodeError:
+                    pass
+            result.append(item)
+        return result
+    finally:
+        conn.close()
+
+
+def parse_limit_from_input(json_input: dict) -> int:
+    limit_value = json_input.get("limit")
+    if limit_value is None and isinstance(json_input.get("search"), dict):
+        limit_value = json_input["search"].get("limit")
+    if limit_value is None:
+        raise RuntimeError("limit is required and must be an integer from 1 to 1000.")
+    try:
+        limit = int(limit_value)
+    except (TypeError, ValueError):
+        raise RuntimeError("limit must be an integer from 1 to 1000.")
+    if limit < 1 or limit > 1000:
+        raise RuntimeError("limit must be in range 1..1000.")
+    return limit
+
+
+def cli_pull_unchecked_jobs(json_input: dict, table_name: str) -> list[dict]:
+    limit = parse_limit_from_input(json_input)
+    jobs = fetch_unchecked_jobs(table_name, limit)
+    print(json.dumps(jobs, ensure_ascii=False))
+    logger.info(f"✅ Pulled from {table_name}: {len(jobs)}")
+    return jobs
+
+
+async def cli_parse_urls_to_jobs(json_input: dict, source_table: str) -> dict:
+    """
+    Parse only unprocessed URLs (is_parse=0) from source table and store details.
+    """
+    if source_table == "job_urls":
+        target_table = "jobs"
+        fk_column = "job_url_id"
+    elif source_table == "job_urls_bestmatch":
+        target_table = "job_bestmach"
+        fk_column = "job_url_bestmatch_id"
+    else:
+        raise RuntimeError(f"Unsupported source table: {source_table}")
+
+    username, _ = resolve_credentials(json_input)
+    if not username:
+        raise RuntimeError("UPWORK_USERNAME is required to locate cookies. Set it in .env or pass credentials.username.")
+    cookies_file_path = build_cookies_file_path(username)
+    if not cookies_file_path or not os.path.exists(cookies_file_path):
+        raise RuntimeError("Cookies not found. Run login command first.")
+
+    proxy_details = json_input.get("proxy_details", None)
+    session = await build_authenticated_requests_session(
+        "https://www.upwork.com/nx/find-work/",
+        cookies_file_path,
+        proxy_details,
+    )
+
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    parsed_count = 0
+    failed_count = 0
+    skipped_count = 0
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        rows = conn.execute(
+            f"SELECT id, url FROM {source_table} WHERE is_parse = 0 ORDER BY id ASC"
+        ).fetchall()
+
+        if not rows:
+            logger.info(f"ℹ️ No unparsed URLs in {source_table}.")
+            return {"parsed": 0, "failed": 0, "skipped": 0}
+
+        for row_id, url in rows:
+            details = fetch_job_detail(session, url, credentials_provided=True)
+            if not details:
+                failed_count += 1
+                continue
+            try:
+                upsert_parsed_job(conn, target_table, fk_column, row_id, details)
+                conn.execute(
+                    f"UPDATE {source_table} SET is_parse = 1, last_seen_at = datetime('now') WHERE id = ?",
+                    (row_id,),
+                )
+                parsed_count += 1
+            except Exception as db_err:
+                logger.debug(f"Failed DB upsert for {url}: {db_err}")
+                skipped_count += 1
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    logger.info(
+        f"✅ Parsed from {source_table}: parsed={parsed_count}, failed={failed_count}, skipped={skipped_count}"
+    )
+    return {"parsed": parsed_count, "failed": failed_count, "skipped": skipped_count}
+
+
+def save_job_urls_to_db(urls: list[str], query: str, table_name: str) -> int:
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    inserted_or_updated = 0
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        for url in urls:
+            job_id = extract_job_id_from_url(url)
+            if table_name == "job_urls":
+                conn.execute(
+                    """
+                    INSERT INTO job_urls (url, job_id, query)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(url) DO UPDATE SET
+                        job_id=excluded.job_id,
+                        query=excluded.query,
+                        last_seen_at=datetime('now')
+                    """,
+                    (url, job_id, query),
+                )
+            elif table_name == "job_urls_bestmatch":
+                conn.execute(
+                    """
+                    INSERT INTO job_urls_bestmatch (url, job_id)
+                    VALUES (?, ?)
+                    ON CONFLICT(url) DO UPDATE SET
+                        job_id=excluded.job_id,
+                        last_seen_at=datetime('now')
+                    """,
+                    (url, job_id),
+                )
+            else:
+                raise RuntimeError(f"Unsupported URL table: {table_name}")
+            inserted_or_updated += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return inserted_or_updated
+
+
+async def build_authenticated_requests_session(search_url: str, cookies_file_path: str, proxy_details: dict | None):
+    async with AsyncCamoufox(headless=True, geoip=True, humanize=True, i_know_what_im_doing=True, config={'forceScopeAccess': True}, disable_coop=True, proxy=proxy_details) as browser:
+        context = await browser.new_context()
+        page = await context.new_page()
+
+        cookies_loaded = await load_cookies_from_file(context, cookies_file_path)
+        if not cookies_loaded:
+            raise RuntimeError("Failed to load cookies. Run login command again.")
+
+        await safe_goto(page, search_url, context)
+        await solve_captcha(
+            queryable=page,
+            browser_context=context,
+            captcha_type='cloudflare',
+            challenge_type='interstitial',
+            solve_attempts=5,
+            solve_click_delay=6,
+            wait_checkbox_attempts=5,
+            wait_checkbox_delay=5,
+            checkbox_click_attempts=3,
+            attempt_delay=5,
+        )
+
+        cookies_valid = await verify_cookies_validity(page, context)
+        if not cookies_valid:
+            raise RuntimeError("Cookies are expired or invalid. Run login command again.")
+
+        return await get_requests_session_from_playwright(context, page, proxy_details=proxy_details)
+
+
+async def cli_collect_urls(json_input: dict) -> int:
+    """Collect job URLs by query/limit and store into job_urls table."""
+    search_params = json_input.get("search", {}) or {}
+    if not isinstance(search_params, dict):
+        raise RuntimeError("search must be a JSON object.")
+
+    query_value = (search_params.get("query") or "").strip()
+    if not query_value:
+        raise RuntimeError("search.query is required for collect-urls command.")
+    parse_and_validate_limit(search_params, required=True)
+
+    username, _ = resolve_credentials(json_input)
+    if not username:
+        raise RuntimeError("UPWORK_USERNAME is required to locate cookies. Set it in .env or pass credentials.username.")
+    cookies_file_path = build_cookies_file_path(username)
+    if not cookies_file_path or not os.path.exists(cookies_file_path):
+        raise RuntimeError("Cookies not found. Run login command first.")
+
+    normalized_search_params, limit = normalize_search_params(search_params, True, 0)
+    search_url = build_upwork_search_url(normalized_search_params)
+    proxy_details = json_input.get("proxy_details", None)
+    session = await build_authenticated_requests_session(search_url, cookies_file_path, proxy_details)
+    urls = get_job_urls_requests(session, [query_value], [search_url], limit=limit).get(query_value, [])
+    saved_count = save_job_urls_to_db(urls, query_value, "job_urls")
+    logger.info(f"✅ URLs saved to job_urls: {saved_count}")
+    return saved_count
+
+
+async def cli_collect_bestmatch_urls(json_input: dict) -> int:
+    """Collect best match URLs by limit and store into job_urls_bestmatch table."""
+    search_params = json_input.get("search", {}) or {}
+    if not isinstance(search_params, dict):
+        raise RuntimeError("search must be a JSON object.")
+    parse_and_validate_limit(search_params, required=True)
+
+    username, _ = resolve_credentials(json_input)
+    if not username:
+        raise RuntimeError("UPWORK_USERNAME is required to locate cookies. Set it in .env or pass credentials.username.")
+    cookies_file_path = build_cookies_file_path(username)
+    if not cookies_file_path or not os.path.exists(cookies_file_path):
+        raise RuntimeError("Cookies not found. Run login command first.")
+
+    bestmatch_search = dict(search_params)
+    bestmatch_search["sort"] = "relevance"
+    for key in ("query", "search_any", "search_exact", "search_none", "search_title"):
+        bestmatch_search.pop(key, None)
+
+    normalized_search_params, limit = normalize_search_params(bestmatch_search, True, 0)
+    search_url = build_upwork_search_url(normalized_search_params)
+    proxy_details = json_input.get("proxy_details", None)
+    session = await build_authenticated_requests_session(search_url, cookies_file_path, proxy_details)
+    urls = get_job_urls_requests(session, ["bestmatch"], [search_url], limit=limit).get("bestmatch", [])
+    saved_count = save_job_urls_to_db(urls, "bestmatch", "job_urls_bestmatch")
+    logger.info(f"✅ URLs saved to job_urls_bestmatch: {saved_count}")
+    return saved_count
+
+
+async def cli_login(json_input: dict) -> str:
+    """
+    Login-only command: authenticate on Upwork and save cookies.
+    """
+    username, password = resolve_credentials(json_input)
+    if (username and not password) or (password and not username):
+        raise RuntimeError("Both credentials are required for login: set UPWORK_USERNAME and UPWORK_PASSWORD in .env.")
+    if not username or not password:
+        raise RuntimeError("UPWORK credentials are required for login. Set UPWORK_USERNAME and UPWORK_PASSWORD in .env")
+
+    cookies_file_path = build_cookies_file_path(username)
+    proxy_details = json_input.get("proxy_details", None)
+    search_url = "https://www.upwork.com/nx/find-work/"
+    login_url = "https://www.upwork.com/ab/account-security/login"
+
+    async with AsyncCamoufox(headless=True, geoip=True, humanize=True, i_know_what_im_doing=True, config={'forceScopeAccess': True}, disable_coop=True, proxy=proxy_details) as browser:
+        context = await browser.new_context()
+        page = await context.new_page()
+        page, context = await login_and_solve(
+            page, context, username, password, search_url, login_url, True, cookies_file_path
+        )
+
+        cookies_valid = await verify_cookies_validity(page, context)
+        if not cookies_valid:
+            raise RuntimeError("Login failed: could not establish a valid authenticated session")
+
+        await save_cookies_to_file(context, cookies_file_path)
+        return cookies_file_path
+
+
+async def cli_search_with_cookies(json_input: dict, *, require_query: bool = True) -> list[dict]:
+    """
+    Search-only command: use existing cookies; fail if missing or expired.
+    """
+    logger.info("🏁 Starting cookie-based search...")
+    start_time = time.time()
+
+    search_params = json_input.get("search", {}) or {}
+    if not isinstance(search_params, dict):
+        raise RuntimeError("search must be a JSON object.")
+
+    if require_query:
+        query_value = (search_params.get("query") or "").strip()
+        if not query_value:
+            raise RuntimeError("search.query is required for search command.")
+    parse_and_validate_limit(search_params, required=True)
+
+    username, _ = resolve_credentials(json_input)
+    if not username:
+        raise RuntimeError("UPWORK_USERNAME is required to locate cookies. Set it in .env or pass credentials.username.")
+    cookies_file_path = build_cookies_file_path(username)
+    if not cookies_file_path or not os.path.exists(cookies_file_path):
+        raise RuntimeError("Cookies not found. Run login command first.")
+
+    general_params = json_input.get("general", {})
+    save_csv = general_params.get("save_csv", False)
+    proxy_details = json_input.get("proxy_details", None)
+
+    buffer = 20
+    normalized_search_params, limit = normalize_search_params(search_params, True, buffer)
+    search_url = build_upwork_search_url(normalized_search_params)
+    search_queries = [search_params.get("query", search_params.get("search_any", "search"))]
+    search_urls = [search_url]
+
+    session = await build_authenticated_requests_session(search_url, cookies_file_path, proxy_details)
+
+    logger.info("💼 Getting Related Jobs...")
+    job_urls_dict = get_job_urls_requests(session, search_queries, search_urls, limit=limit)
+    job_urls = list(job_urls_dict.values())[0]
+    logger.debug(f"Got {len(job_urls)} job URLs.")
+
+    logger.info("🏢 Getting Job Attributes with requests...")
+    job_attributes = browser_worker_requests(session, job_urls, True, max_workers=25)
+    job_attributes = job_attributes[:limit - buffer]
+
+    if save_csv:
+        df = pd.DataFrame(job_attributes)
+        df = df.sort_index(axis=1)
+        df.to_csv(f'data/jobs/csv/job_results_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.csv', index=False)
+
+    elapsed = time.time() - start_time
+    logger.info(f"🏁 Cookie-based search complete. Results: {len(job_attributes)}; time: {elapsed:.2f}s")
+    return job_attributes
+
+
 async def main(jsonInput: dict) -> list[dict]:
     """
     Main entry point for the Upwork Job Scraper. Orchestrates browser setup, login, job search, and extraction.
@@ -986,8 +1501,9 @@ async def main(jsonInput: dict) -> list[dict]:
     else:
         credentials_json = jsonInput
     # set username and password
-    username = credentials_json.get('username', None)
-    password = credentials_json.get('password', None)
+    # Fallback to .env values so CLI can run without passing secrets in terminal
+    username = credentials_json.get('username') or os.getenv('UPWORK_USERNAME')
+    password = credentials_json.get('password') or os.getenv('UPWORK_PASSWORD')
     if (username and not password) or (password and not username):
         logger.warning("Both username and password must be provided for authentication. One is missing.")
     credentials_provided = username and password
@@ -1041,7 +1557,7 @@ async def main(jsonInput: dict) -> list[dict]:
             page = await context.new_page()
         except Exception as e:
             logger.error(f"⚠️ Error creating browser: {e}")
-            sys.exit(1)
+            raise RuntimeError(f"Error creating browser: {e}") from e
         try:
             if credentials_provided:
                 logger.info("🔒 Solving Captcha and Logging in...")
@@ -1050,7 +1566,7 @@ async def main(jsonInput: dict) -> list[dict]:
             page, context = await login_and_solve(page, context, username, password, search_url, login_url, credentials_provided, cookies_file_path)
         except Exception as e:
             logger.error(f"⚠️ Error logging in: {e}")
-            sys.exit(1)
+            raise RuntimeError(f"Error logging in: {e}") from e
         # Extract cookies and user-agent, build requests session
         session = await get_requests_session_from_playwright(context, page, proxy_details=proxy_details)
     # Use requests for all scraping
@@ -1061,14 +1577,14 @@ async def main(jsonInput: dict) -> list[dict]:
         logger.debug(f"Got {len(job_urls)} job URLs.")
     except Exception as e:
         logger.error(f"⚠️ Error getting jobs: {e}")
-        sys.exit(1)
+        raise RuntimeError(f"Error getting jobs: {e}") from e
     # Process jobs with requests
     try:
         logger.info("🏢 Getting Job Attributes with requests...")
         job_attributes = browser_worker_requests(session, job_urls, credentials_provided, max_workers=NUM_DETAIL_WORKERS)
     except Exception as e:
         logger.error(f"⚠️ Error getting job attributes: {e}")
-        sys.exit(1)
+        raise RuntimeError(f"Error getting job attributes: {e}") from e
     # Filter out jobs where Nuxt data was missing (i.e., job is None)
     # job_attributes = [job for job in job_attributes if job is not None and all(v is not None for v in job.values())]
     logger.debug(f"job_attributes after filter: {len(job_attributes)}")
@@ -1100,6 +1616,7 @@ async def main(jsonInput: dict) -> list[dict]:
 if __name__ == "__main__":
     # set argparse
     parser = argparse.ArgumentParser(description="Upwork Job Scraper")
+    parser.add_argument('--command', type=str, choices=['login', 'search', 'best-match', 'collect-urls', 'collect-bestmatch-urls', 'parse-job-urls', 'parse-bestmatch-urls', 'pull-jobs', 'pull-bestmatch-jobs'], default='search', help='CLI command: login, search, best-match, collect-urls, collect-bestmatch-urls, parse-job-urls, parse-bestmatch-urls, pull-jobs, pull-bestmatch-jobs')
     parser.add_argument('--jsonInput', type=str, help='JSON string or path to JSON file with credentials and other info')
     args = parser.parse_args()
 
@@ -1124,8 +1641,16 @@ if __name__ == "__main__":
         try:
             input_data = json.loads(args.jsonInput)
         except json.JSONDecodeError as e:
-            logger.error(f"⚠️ Failed to parse input JSON: {e}")
-            sys.exit(1)
+            if os.path.exists(args.jsonInput):
+                try:
+                    with open(args.jsonInput, "r", encoding="utf-8") as f:
+                        input_data = json.load(f)
+                except Exception as file_error:
+                    logger.error(f"⚠️ Failed to parse JSON file `{args.jsonInput}`: {file_error}")
+                    sys.exit(1)
+            else:
+                logger.error(f"⚠️ Failed to parse input JSON string: {e}")
+                sys.exit(1)
     # load from apify
     elif os.environ.get("ACTOR_INPUT_KEY"):
         from apify import Actor
@@ -1197,5 +1722,35 @@ if __name__ == "__main__":
         }
 
     logger.debug(f"input_data: {input_data}")
-    asyncio.run(main(input_data))
-    sys.exit(0)
+    try:
+        if args.command == 'login':
+            cookies_path = asyncio.run(cli_login(input_data))
+            logger.info(f"✅ Login successful. Cookies saved to: {cookies_path}")
+        elif args.command == 'search':
+            asyncio.run(cli_search_with_cookies(input_data, require_query=True))
+        elif args.command == 'best-match':
+            search_payload = dict(input_data)
+            search_payload["search"] = dict(input_data.get("search", {}))
+            # Best Match mode should not send query terms.
+            for key in ("query", "search_any", "search_exact", "search_none", "search_title"):
+                search_payload["search"].pop(key, None)
+            search_payload["search"]["sort"] = "relevance"
+            asyncio.run(cli_search_with_cookies(search_payload, require_query=False))
+        elif args.command == 'collect-urls':
+            asyncio.run(cli_collect_urls(input_data))
+        elif args.command == 'collect-bestmatch-urls':
+            asyncio.run(cli_collect_bestmatch_urls(input_data))
+        elif args.command == 'parse-job-urls':
+            asyncio.run(cli_parse_urls_to_jobs(input_data, "job_urls"))
+        elif args.command == 'parse-bestmatch-urls':
+            asyncio.run(cli_parse_urls_to_jobs(input_data, "job_urls_bestmatch"))
+        elif args.command == 'pull-jobs':
+            cli_pull_unchecked_jobs(input_data, "jobs")
+        elif args.command == 'pull-bestmatch-jobs':
+            cli_pull_unchecked_jobs(input_data, "job_bestmach")
+        else:
+            raise RuntimeError(f"Unsupported command: {args.command}")
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"❌ Command failed: {e}")
+        sys.exit(1)
